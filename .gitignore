@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+node_modules/
+.impeccable/
+tmp/
+*.log
+*.wav
+*.mp3
+*.webm
+*.ogg
+*.opus
+*.m4a
+*.flac

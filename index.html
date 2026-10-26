@@ -1,0 +1,98 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Fish Voice Test</title><link rel="icon" href="data:,">
+<style>
+body{font:15px system-ui;max-width:760px;margin:24px auto;padding:0 16px;background:#fafafa;color:#222}
+section{background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px 16px;margin:12px 0}
+button{padding:6px 12px}textarea{width:100%;box-sizing:border-box}#log div{margin:4px 0}.ai{color:#06c}.t{color:#595959;font-size:12px}
+</style></head><body>
+<h2>Fish Audio voice test</h2>
+<div id="status" class="t"></div>
+
+<section><h3>1. Clone</h3>
+<input id="title" placeholder="voice name" value="my-voice">
+<button id="rec">● Record sample</button> or <input type="file" id="file" accept="audio/*">
+<button id="clone" disabled>Create voice</button> <span id="cloneMsg" class="t"></span>
+<p class="t">Read anything naturally for ~15–30s.</p>
+</section>
+
+<section><h3>2. Call</h3>
+Voice: <select id="voice"></select> <button id="refresh">↻</button><br><br>
+System prompt:<textarea id="system" rows="2">You are a friendly person on a phone call. Reply in 1-2 short spoken sentences, no markdown.</textarea><br><br>
+<button id="call">Start call</button> <span id="callMsg" class="t"></span>
+</section>
+
+<section><h3>3. Transcript</h3><div id="log"></div></section>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let sample = null;
+const api = async (path, opts) => { const r = await fetch(path, opts); const j = await r.json(); if (!r.ok) throw new Error(j.error); return j; };
+const say = (cls, text) => { const d = document.createElement('div'); d.className = cls; d.textContent = text; $('log').append(d); d.scrollIntoView(); };
+
+fetch('/api/status').then((r) => r.json()).then((s) => {
+  $('status').textContent = `FISH_API_KEY: ${s.FISH_API_KEY ? 'ok' : 'MISSING'} · LLM_API_KEY: ${s.LLM_API_KEY ? 'ok' : 'MISSING'} · LLM ${s.LLM_MODEL} · TTS ${s.TTS_MODEL}`;
+  if (s.FISH_API_KEY) loadVoices();
+});
+async function loadVoices() {
+  try { $('voice').innerHTML = (await api('/api/voices')).map((v) => `<option value="${v.id}">${v.title} (${v.state})</option>`).join(''); }
+  catch (e) { $('callMsg').textContent = e.message; }
+}
+$('refresh').onclick = loadVoices;
+
+// --- clone ---
+let recorder;
+$('rec').onclick = async () => {
+  if (recorder?.state === 'recording') return recorder.stop();
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const chunks = []; recorder = new MediaRecorder(stream);
+  recorder.ondataavailable = (e) => chunks.push(e.data);
+  recorder.onstop = () => { stream.getTracks().forEach((t) => t.stop()); sample = new Blob(chunks); $('clone').disabled = false; $('rec').textContent = '● Re-record'; };
+  recorder.start(); $('rec').textContent = '■ Stop';
+};
+$('file').onchange = () => { sample = $('file').files[0]; $('clone').disabled = !sample; };
+$('clone').onclick = async () => {
+  $('cloneMsg').textContent = 'uploading…';
+  try { const v = await api(`/api/clone?title=${encodeURIComponent($('title').value)}`, { method: 'POST', body: sample });
+    $('cloneMsg').textContent = `created ${v.id} (${v.state}) in ${v.ms}ms`; await loadVoices(); $('voice').value = v.id; }
+  catch (e) { $('cloneMsg').textContent = e.message; }
+};
+
+// --- call: simple energy VAD, one utterance per turn ---
+let live = false, history = [];
+const player = new Audio();
+$('call').onclick = async () => {
+  if (live) { live = false; player.pause(); $('call').textContent = 'Start call'; $('callMsg').textContent = 'hung up'; return; }
+  live = true; history = []; $('call').textContent = 'Hang up';
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+  const ctx = new AudioContext(), an = ctx.createAnalyser(); ctx.createMediaStreamSource(stream).connect(an);
+  const buf = new Float32Array(an.fftSize);
+  const level = () => { an.getFloatTimeDomainData(buf); return Math.sqrt(buf.reduce((s, x) => s + x * x, 0) / buf.length); };
+  while (live) {
+    $('callMsg').textContent = 'listening…';
+    const rec = new MediaRecorder(stream), chunks = [];
+    rec.ondataavailable = (e) => chunks.push(e.data); rec.start();
+    let spoke = false, quietSince = 0;
+    while (live) { // wait for speech, then 800ms silence
+      await new Promise((r) => setTimeout(r, 50));
+      const l = level();
+      if (l > 0.02) { spoke = true; quietSince = 0; } else if (spoke) { quietSince ||= Date.now(); if (Date.now() - quietSince > 800) break; }
+    }
+    const stopped = new Promise((r) => rec.onstop = r); rec.stop(); await stopped;
+    if (!live) break;
+    const t0 = Date.now(); $('callMsg').textContent = 'thinking…';
+    try {
+      const q = new URLSearchParams({ voice: $('voice').value, system: $('system').value, history: JSON.stringify(history.slice(-10)) });
+      const turn = await api(`/api/turn?${q}`, { method: 'POST', body: new Blob(chunks) });
+      say('', 'You: ' + turn.user); history.push({ role: 'user', content: turn.user }, { role: 'assistant', content: turn.reply });
+      const tTts = Date.now(); player.src = turn.tts; player.play();
+      await new Promise((r, j) => { player.onplaying = r; player.onerror = () => j(new Error("TTS playback failed")); });
+      const first = Date.now() - tTts, total = Date.now() - t0;
+      say('ai', 'AI: ' + turn.reply);
+      say('t', `ASR ${turn.asr_ms}ms · LLM ${turn.llm_ms}ms · TTS first audio ${first}ms · end-of-speech→audio ${total}ms`);
+      $('callMsg').textContent = 'speaking…';
+      await new Promise((r) => { player.onended = r; player.onerror = r; player.onpause = r; });
+    } catch (e) { say('t', 'error: ' + e.message); }
+  }
+  stream.getTracks().forEach((t) => t.stop()); ctx.close();
+};
+</script></body></html>
