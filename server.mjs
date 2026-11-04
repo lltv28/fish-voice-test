@@ -6,8 +6,14 @@ import { randomUUID } from 'node:crypto';
 
 try { process.loadEnvFile('.env'); } catch {}
 const { FISH_API_KEY, LLM_API_KEY, LLM_BASE_URL = 'https://api.openai.com/v1', LLM_MODEL = 'gpt-4o-mini',
-  TTS_MODEL = 's2-pro', PORT = 8787 } = process.env;
+  TTS_MODEL = 's2-pro', PORT = 8787, ANAM_API_KEY,
+  ANAM_AVATAR_ID = '30fa96d0-26c4-4e55-94a0-517025942e18', // stock "Cara" from the Anam gallery
+  ANAM_LLM_ID = 'a7cf662c-2ace-4de1-a21e-ef0fbf144bb7' } = process.env; // Anam's default LLM, turnkey mode only
 const FISH = 'https://api.fish.audio';
+const ANAM = 'https://api.anam.ai/v1';
+const anamPost = async (path, obj) => (await ok(await fetch(`${ANAM}${path}`, {
+  method: 'POST', headers: { Authorization: `Bearer ${ANAM_API_KEY}`, 'content-type': 'application/json' }, body: JSON.stringify(obj),
+}))).json();
 const fishAuth = { Authorization: `Bearer ${FISH_API_KEY}` };
 
 // browser webm/opus -> mono mp3 (piped wav would have a bogus length header)
@@ -46,7 +52,19 @@ async function handle(req, res) {
   const route = `${req.method} ${url.pathname}`;
 
   if (route === 'GET /') { res.writeHead(200, { 'content-type': 'text/html' }); return res.end(readFileSync('index.html')); }
-  if (route === 'GET /api/status') return json(res, 200, { FISH_API_KEY: !!FISH_API_KEY, LLM_API_KEY: !!LLM_API_KEY, LLM_MODEL, TTS_MODEL });
+  if (route === 'GET /api/status') return json(res, 200, { FISH_API_KEY: !!FISH_API_KEY, LLM_API_KEY: !!LLM_API_KEY, ANAM_API_KEY: !!ANAM_API_KEY, ANAM_AVATAR_ID, LLM_MODEL, TTS_MODEL });
+
+  if (url.pathname.startsWith('/api/anam/') && !ANAM_API_KEY) return json(res, 500, { error: 'ANAM_API_KEY missing in .env' });
+  if (route === 'POST /api/anam/session') { // ?avatar=  passthrough: our audio drives the face. +voice=&system= : Anam turnkey
+    const personaConfig = { avatarId: q.avatar || ANAM_AVATAR_ID, avatarModel: 'cara-4' };
+    if (q.voice) Object.assign(personaConfig, { voiceId: q.voice, llmId: ANAM_LLM_ID, systemPrompt: q.system, skipGreeting: true });
+    else personaConfig.enableAudioPassthrough = true;
+    return json(res, 200, { token: (await anamPost('/auth/session-token', { personaConfig })).sessionToken });
+  }
+  if (route === 'POST /api/anam/import-voice') { // ?voice=<fish id>; Anam only imports public Fish voices
+    const v = await anamPost('/voice-imports', { provider: 'FISH_AUDIO', providerVoiceId: q.voice });
+    return json(res, 200, { id: v.id, name: v.displayName });
+  }
   if (!FISH_API_KEY) return json(res, 500, { error: 'FISH_API_KEY missing in .env' });
 
   if (route === 'GET /api/voices') {
@@ -56,7 +74,7 @@ async function handle(req, res) {
 
   if (route === 'POST /api/clone') { // body = raw audio, ?title=
     const fd = new FormData();
-    fd.append('type', 'tts'); fd.append('title', q.title || 'clone'); fd.append('visibility', 'private'); fd.append('train_mode', 'fast');
+    fd.append('type', 'tts'); fd.append('title', q.title || 'clone'); fd.append('visibility', q.public ? 'public' : 'private'); fd.append('train_mode', 'fast');
     fd.append('voices', new Blob([await toMp3(await body(req))], { type: 'audio/mpeg' }), 'sample.mp3');
     const t = Date.now();
     const r = await ok(await fetch(`${FISH}/model`, { method: 'POST', headers: fishAuth, body: fd }));
@@ -76,13 +94,14 @@ async function handle(req, res) {
     return json(res, 200, { user, reply, asr_ms, llm_ms, tts: `/api/tts/${id}` });
   }
 
-  if (req.method === 'GET' && url.pathname.startsWith('/api/tts')) { // streams Fish mp3 straight to <audio>
+  if (req.method === 'GET' && url.pathname.startsWith('/api/tts')) { // streams Fish mp3 to <audio>, or ?pcm=1 raw s16le 24k mono for Anam
     const job = pending.get(url.pathname.split('/')[3]) || { text: q.text, voice: q.voice };
+    const format = q.pcm ? { format: 'pcm', sample_rate: 24000 } : { format: 'mp3' };
     const r = await ok(await fetch(`${FISH}/v1/tts`, {
       method: 'POST', headers: { ...fishAuth, 'content-type': 'application/json', model: TTS_MODEL },
-      body: JSON.stringify({ text: job.text, reference_id: job.voice || undefined, format: 'mp3', latency: 'balanced' }),
+      body: JSON.stringify({ text: job.text, reference_id: job.voice || undefined, ...format, latency: 'balanced' }),
     }));
-    res.writeHead(200, { 'content-type': 'audio/mpeg' });
+    res.writeHead(200, { 'content-type': q.pcm ? 'application/octet-stream' : 'audio/mpeg' });
     for await (const chunk of r.body) res.write(chunk);
     return res.end();
   }

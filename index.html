@@ -3,7 +3,7 @@
 <style>
 body{font:15px system-ui;max-width:760px;margin:24px auto;padding:0 16px;background:#fafafa;color:#222}
 section{background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px 16px;margin:12px 0}
-button{padding:6px 12px}textarea{width:100%;box-sizing:border-box}#log div{margin:4px 0}.ai{color:#06c}.t{color:#595959;font-size:12px}
+button{padding:6px 12px}video{width:100%;max-height:420px;background:#000;border-radius:8px;margin-top:8px}textarea{width:100%;box-sizing:border-box}#log div{margin:4px 0}.ai{color:#06c}.t{color:#595959;font-size:12px}
 </style></head><body>
 <h2>Fish Audio voice test</h2>
 <div id="status" class="t"></div>
@@ -11,16 +11,26 @@ button{padding:6px 12px}textarea{width:100%;box-sizing:border-box}#log div{margi
 <section><h3>1. Clone</h3>
 <input id="title" placeholder="voice name" value="my-voice">
 <button id="rec">● Record sample</button> or <input type="file" id="file" accept="audio/*">
+<label><input type="checkbox" id="public"> public</label>
 <button id="clone" disabled>Create voice</button> <span id="cloneMsg" class="t"></span>
-<p class="t">Read anything naturally for ~15–30s.</p>
+<p class="t">Read anything naturally for ~15–30s. Tick "public" only if you want to import it into Anam for turnkey mode (Anam can only import public Fish voices).</p>
 </section>
 
 <section><h3>2. Call</h3>
 Voice: <select id="voice"></select> <button id="refresh">↻</button><br><br>
 System prompt:<textarea id="system" rows="2">You are a friendly person on a phone call. Reply in 1-2 short spoken sentences, no markdown.</textarea><br><br>
-<button id="call">Start call</button> <span id="callMsg" class="t"></span>
+Mode: <select id="mode">
+  <option value="audio">Audio only</option>
+  <option value="pass" selected>Avatar: our pipeline, Anam renders face (passthrough)</option>
+  <option value="turnkey">Avatar: Anam turnkey (Fish voice imported into Anam)</option>
+</select>
+<div class="avatar">Anam avatar id: <input id="avatarId" size="38" placeholder="default stock avatar"></div>
+<div class="turnkey">Anam voice id: <input id="anamVoice" size="38"> <button id="import">Import selected Fish voice</button> <span id="importMsg" class="t"></span>
+<p class="t">Turnkey: Anam does speech-to-text and the LLM, then speaks in the imported Fish voice. Our ASR/LLM settings are not used.</p></div>
+<br><button id="call">Start call</button> <span id="callMsg" class="t"></span>
 </section>
 
+<video id="avatar" autoplay playsinline hidden></video>
 <section><h3>3. Transcript</h3><div id="log"></div></section>
 
 <script>
@@ -30,7 +40,8 @@ const api = async (path, opts) => { const r = await fetch(path, opts); const j =
 const say = (cls, text) => { const d = document.createElement('div'); d.className = cls; d.textContent = text; $('log').append(d); d.scrollIntoView(); };
 
 fetch('/api/status').then((r) => r.json()).then((s) => {
-  $('status').textContent = `FISH_API_KEY: ${s.FISH_API_KEY ? 'ok' : 'MISSING'} · LLM_API_KEY: ${s.LLM_API_KEY ? 'ok' : 'MISSING'} · LLM ${s.LLM_MODEL} · TTS ${s.TTS_MODEL}`;
+  $('status').textContent = `FISH_API_KEY: ${s.FISH_API_KEY ? 'ok' : 'MISSING'} · LLM_API_KEY: ${s.LLM_API_KEY ? 'ok' : 'MISSING'} · ANAM_API_KEY: ${s.ANAM_API_KEY ? 'ok' : 'MISSING'} · LLM ${s.LLM_MODEL} · TTS ${s.TTS_MODEL}`;
+  $('avatarId').placeholder = s.ANAM_AVATAR_ID;
   if (s.FISH_API_KEY) loadVoices();
 });
 async function loadVoices() {
@@ -52,28 +63,100 @@ $('rec').onclick = async () => {
 $('file').onchange = () => { sample = $('file').files[0]; $('clone').disabled = !sample; };
 $('clone').onclick = async () => {
   $('cloneMsg').textContent = 'uploading…';
-  try { const v = await api(`/api/clone?title=${encodeURIComponent($('title').value)}`, { method: 'POST', body: sample });
+  try { const v = await api(`/api/clone?title=${encodeURIComponent($('title').value)}${$('public').checked ? '&public=1' : ''}`, { method: 'POST', body: sample });
     $('cloneMsg').textContent = `created ${v.id} (${v.state}) in ${v.ms}ms`; await loadVoices(); $('voice').value = v.id; }
   catch (e) { $('cloneMsg').textContent = e.message; }
 };
+
+// --- mode switch + Anam avatar ---
+const showMode = () => { document.querySelector('.avatar').hidden = $('mode').value === 'audio'; document.querySelector('.turnkey').hidden = $('mode').value !== 'turnkey'; };
+$('mode').onchange = showMode; showMode();
+$('import').onclick = async () => {
+  $('importMsg').textContent = 'importing (can take ~1 min)…';
+  try { const v = await api(`/api/anam/import-voice?voice=${$('voice').value}`, { method: 'POST' }); $('anamVoice').value = v.id; $('importMsg').textContent = `imported "${v.name}"`; }
+  catch (e) { $('importMsg').textContent = e.message; }
+};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const rms = (an, buf) => { an.getFloatTimeDomainData(buf); return Math.sqrt(buf.reduce((s, x) => s + x * x, 0) / buf.length); };
+const waitFor = async (cond, ms) => { const end = Date.now() + ms; while (!cond()) { if (Date.now() > end) return false; await sleep(20); } return true; };
+
+let anam = null; // { client, AnamEvent, speaking(), audioIn }
+async function startAnam(turnkey) {
+  const { createClient, AnamEvent } = await import('https://esm.sh/@anam-ai/js-sdk@4.29.1');
+  const q = new URLSearchParams({ avatar: $('avatarId').value.trim() });
+  if (turnkey) { if (!$('anamVoice').value) throw new Error('import a Fish voice into Anam first'); q.set('voice', $('anamVoice').value.trim()); q.set('system', $('system').value); }
+  const { token } = await api(`/api/anam/session?${q}`, { method: 'POST' });
+  const client = createClient(token, turnkey ? {} : { disableInputAudio: true });
+  const a = { client, AnamEvent, speaking: () => false };
+  // avatar latency = when the avatar's own (lip-synced) audio track goes non-silent
+  client.addListener(AnamEvent.AUDIO_STREAM_STARTED, (stream) => {
+    const ctx = new AudioContext(), an = ctx.createAnalyser(), buf = new Float32Array(an.fftSize);
+    ctx.createMediaStreamSource(stream).connect(an); a.ctx = ctx;
+    a.speaking = () => rms(an, buf) > 0.01;
+  });
+  client.addListener(AnamEvent.CONNECTION_CLOSED, (reason) => { if (live) say('t', 'avatar disconnected: ' + reason); });
+  if (turnkey) {
+    let shown = 0;
+    client.addListener(AnamEvent.MESSAGE_HISTORY_UPDATED, (msgs) => { for (const m of msgs.slice(shown)) say(m.role === 'user' ? '' : 'ai', (m.role === 'user' ? 'You: ' : 'AI: ') + m.content); shown = msgs.length; });
+    client.addListener(AnamEvent.USER_SPEECH_ENDED, async () => {
+      const t0 = Date.now(); $('callMsg').textContent = 'thinking…';
+      if (await waitFor(a.speaking, 15000)) { say('t', `end-of-speech→avatar speaking ${Date.now() - t0}ms (Anam STT+LLM+TTS+render)`); $('callMsg').textContent = 'speaking…'; }
+    });
+  }
+  $('avatar').hidden = false;
+  await client.streamToVideoElement('avatar');
+  if (!turnkey) a.audioIn = client.createAgentAudioInputStream({ encoding: 'pcm_s16le', sampleRate: 24000, channels: 1 });
+  return a;
+}
+async function stopAnam() { if (!anam) return; const a = anam; anam = null; await a.client.stopStreaming().catch(() => {}); a.ctx?.close(); $('avatar').hidden = true; }
+
+// Fish PCM (s16le 24k mono) -> Anam. Returns timings once the avatar has finished speaking.
+async function speakViaAvatar(ttsUrl) {
+  const tTts = Date.now();
+  const r = await fetch(ttsUrl + '?pcm=1'); if (!r.ok) throw new Error('TTS ' + r.status);
+  let firstByte = 0, sent = 0, carry = null;
+  const sending = (async () => {
+    for await (let c of r.body) {
+      if (carry) { const m = new Uint8Array(carry.length + c.length); m.set(carry); m.set(c, carry.length); c = m; carry = null; }
+      if (c.length % 2) { carry = c.slice(-1); c = c.slice(0, -1); } // keep 16-bit samples whole
+      if (!c.length || !anam) continue;
+      if (!firstByte) firstByte = Date.now();
+      anam.audioIn.sendAudioChunk(c); sent += c.length;
+    }
+    anam?.audioIn.endSequence();
+  })();
+  await waitFor(() => firstByte, 15000);
+  const onset = await waitFor(() => anam?.speaking(), 15000) ? Date.now() : 0;
+  await sending;
+  if (onset) await waitFor(() => !live, Math.max(0, onset + sent / 48 - Date.now()) + 300); // 48 bytes = 1ms of 24k s16 mono
+  if (!live) anam?.client.interruptPersona();
+  return { ttfb: firstByte - tTts, avatar: onset ? onset - firstByte : null, onset };
+}
 
 // --- call: simple energy VAD, one utterance per turn ---
 let live = false, history = [];
 const player = new Audio();
 $('call').onclick = async () => {
-  if (live) { live = false; player.pause(); $('call').textContent = 'Start call'; $('callMsg').textContent = 'hung up'; return; }
+  if (live) { live = false; player.pause(); stopAnam(); $('call').textContent = 'Start call'; $('callMsg').textContent = 'hung up'; return; }
+  const mode = $('mode').value;
   live = true; history = []; $('call').textContent = 'Hang up';
+  if (mode !== 'audio') {
+    $('callMsg').textContent = 'starting avatar…';
+    try { anam = await startAnam(mode === 'turnkey'); }
+    catch (e) { say('t', 'error: ' + e.message); live = false; stopAnam(); $('call').textContent = 'Start call'; $('callMsg').textContent = ''; return; }
+    if (mode === 'turnkey') { $('callMsg').textContent = 'connected, talk to the avatar'; return; } // Anam owns mic + turns
+  }
   const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
   const ctx = new AudioContext(), an = ctx.createAnalyser(); ctx.createMediaStreamSource(stream).connect(an);
   const buf = new Float32Array(an.fftSize);
-  const level = () => { an.getFloatTimeDomainData(buf); return Math.sqrt(buf.reduce((s, x) => s + x * x, 0) / buf.length); };
+  const level = () => rms(an, buf);
   while (live) {
     $('callMsg').textContent = 'listening…';
     const rec = new MediaRecorder(stream), chunks = [];
     rec.ondataavailable = (e) => chunks.push(e.data); rec.start();
     let spoke = false, quietSince = 0;
     while (live) { // wait for speech, then 800ms silence
-      await new Promise((r) => setTimeout(r, 50));
+      await sleep(50);
       const l = level();
       if (l > 0.02) { spoke = true; quietSince = 0; } else if (spoke) { quietSince ||= Date.now(); if (Date.now() - quietSince > 800) break; }
     }
@@ -84,10 +167,16 @@ $('call').onclick = async () => {
       const q = new URLSearchParams({ voice: $('voice').value, system: $('system').value, history: JSON.stringify(history.slice(-10)) });
       const turn = await api(`/api/turn?${q}`, { method: 'POST', body: new Blob(chunks) });
       say('', 'You: ' + turn.user); history.push({ role: 'user', content: turn.user }, { role: 'assistant', content: turn.reply });
+      say('ai', 'AI: ' + turn.reply);
+      if (anam) {
+        $('callMsg').textContent = 'speaking…';
+        const s = await speakViaAvatar(turn.tts);
+        say('t', `ASR ${turn.asr_ms}ms · LLM ${turn.llm_ms}ms · TTS first byte ${s.ttfb}ms · avatar (audio sent→avatar speaking) ${s.avatar ?? 'n/a'}ms · end-of-speech→avatar ${s.onset ? s.onset - t0 + 'ms' : 'n/a'}`);
+        continue;
+      }
       const tTts = Date.now(); player.src = turn.tts; player.play();
       await new Promise((r, j) => { player.onplaying = r; player.onerror = () => j(new Error("TTS playback failed")); });
       const first = Date.now() - tTts, total = Date.now() - t0;
-      say('ai', 'AI: ' + turn.reply);
       say('t', `ASR ${turn.asr_ms}ms · LLM ${turn.llm_ms}ms · TTS first audio ${first}ms · end-of-speech→audio ${total}ms`);
       $('callMsg').textContent = 'speaking…';
       await new Promise((r) => { player.onended = r; player.onerror = r; player.onpause = r; });
