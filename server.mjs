@@ -11,9 +11,17 @@ const { FISH_API_KEY, LLM_API_KEY, LLM_BASE_URL = 'https://api.openai.com/v1', L
   ANAM_LLM_ID = 'a7cf662c-2ace-4de1-a21e-ef0fbf144bb7' } = process.env; // Anam's default LLM, turnkey mode only
 const FISH = 'https://api.fish.audio';
 const ANAM = 'https://api.anam.ai/v1';
+const anamAuth = { Authorization: `Bearer ${ANAM_API_KEY}` };
 const anamPost = async (path, obj) => (await ok(await fetch(`${ANAM}${path}`, {
-  method: 'POST', headers: { Authorization: `Bearer ${ANAM_API_KEY}`, 'content-type': 'application/json' }, body: JSON.stringify(obj),
+  method: 'POST', headers: { ...anamAuth, 'content-type': 'application/json' }, body: JSON.stringify(obj),
 }))).json();
+const anamAll = async (path) => { // every page of GET /v1/<path>
+  const get = async (p) => (await ok(await fetch(`${ANAM}${path}?perPage=100&page=${p}`, { headers: anamAuth }))).json();
+  const first = await get(1);
+  const rest = await Promise.all(Array.from({ length: first.meta.lastPage - 1 }, (_, i) => get(i + 2)));
+  return [first, ...rest].flatMap((r) => r.data);
+};
+const byName = (a, b) => a.name.localeCompare(b.name);
 const fishAuth = { Authorization: `Bearer ${FISH_API_KEY}` };
 
 // browser webm/opus -> mono mp3 (piped wav would have a bogus length header)
@@ -61,15 +69,29 @@ async function handle(req, res) {
     else personaConfig.enableAudioPassthrough = true;
     return json(res, 200, { token: (await anamPost('/auth/session-token', { personaConfig })).sessionToken });
   }
+  if (route === 'GET /api/anam/avatars') { // own avatars first, then stock
+    const list = (await anamAll('/avatars')).map((a) => ({ id: a.id, name: [a.displayName, a.variantName].filter(Boolean).join(' · '), own: !!a.createdByOrganizationId, image: a.imageUrl }));
+    return json(res, 200, list.sort((a, b) => b.own - a.own || byName(a, b)));
+  }
+  if (route === 'GET /api/anam/voices') { // group: 0 imported Fish, 1 other own, 2 stock Fish, 3 rest
+    const list = (await anamAll('/voices')).map((v) => ({ id: v.id, name: v.displayName, provider: v.provider,
+      group: (v.createdByOrganizationId ? 0 : 2) + (v.provider === 'FISH_AUDIO' ? 0 : 1) }));
+    return json(res, 200, list.sort((a, b) => a.group - b.group || byName(a, b)));
+  }
   if (route === 'POST /api/anam/import-voice') { // ?voice=<fish id>; Anam only imports public Fish voices
     const v = await anamPost('/voice-imports', { provider: 'FISH_AUDIO', providerVoiceId: q.voice });
     return json(res, 200, { id: v.id, name: v.displayName });
   }
   if (!FISH_API_KEY) return json(res, 500, { error: 'FISH_API_KEY missing in .env' });
 
-  if (route === 'GET /api/voices') {
-    const r = await ok(await fetch(`${FISH}/model?self=true&page_size=50`, { headers: fishAuth }));
-    return json(res, 200, (await r.json()).items.map((m) => ({ id: m._id, title: m.title, state: m.state })));
+  if (route === 'GET /api/voices') { // all own voices, by title
+    const items = [];
+    for (let p = 1; ; p++) {
+      const d = await (await ok(await fetch(`${FISH}/model?self=true&page_size=100&page_number=${p}`, { headers: fishAuth }))).json();
+      items.push(...d.items);
+      if (!d.has_more || !d.items.length) break;
+    }
+    return json(res, 200, items.map((m) => ({ id: m._id, title: m.title, state: m.state })).sort((a, b) => a.title.localeCompare(b.title)));
   }
 
   if (route === 'POST /api/clone') { // body = raw audio, ?title=

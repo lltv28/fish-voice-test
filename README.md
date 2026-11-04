@@ -18,9 +18,9 @@ Optional: the AI can show up as a live talking face via [Anam](https://anam.ai/d
 
 Passthrough keeps the whole pipeline in our hands: the server streams Fish TTS as raw PCM (16-bit, 24 kHz, mono) and the browser forwards each chunk to Anam. Anam waits for 480 ms of audio before it starts animating, so expect that on top of Fish's first byte.
 
-Turnkey needs the Fish voice imported into Anam first: select the voice and press **Import selected Fish voice** (can take about a minute). Anam can only import **public** Fish voices, so tick **public** when you clone, or the import fails. The system prompt box is passed to Anam; the LLM is Anam's default (`ANAM_LLM_ID` to override).
+Turnkey needs the Fish voice imported into Anam first: select the Fish voice and press **Import selected Fish voice** (can take about a minute); it then shows up selected in the Anam voice list. Anam can only import **public** Fish voices, so tick **public** when you clone, or the import fails. The system prompt box is passed to Anam; the LLM is Anam's default (`ANAM_LLM_ID` to override).
 
-Avatar: the stock Anam avatar "Cara" is used by default. Put your own avatar id in the **Anam avatar id** box, or set `ANAM_AVATAR_ID` in `.env`.
+Pickers: the Fish voice list shows all your Fish voices sorted by title. The **Avatar** list shows your own Anam avatars first, then stock ones, with a thumbnail; pick **Custom id…** to paste any id. The default is the stock "Cara" avatar, or `ANAM_AVATAR_ID` from `.env`. In turnkey mode the **Anam voice** list shows imported Fish voices first. The page remembers your last picks in localStorage.
 
 Timings per turn:
 

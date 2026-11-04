@@ -3,7 +3,7 @@
 <style>
 body{font:15px system-ui;max-width:760px;margin:24px auto;padding:0 16px;background:#fafafa;color:#222}
 section{background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px 16px;margin:12px 0}
-button{padding:6px 12px}video{width:100%;max-height:420px;background:#000;border-radius:8px;margin-top:8px}textarea{width:100%;box-sizing:border-box}#log div{margin:4px 0}.ai{color:#06c}.t{color:#595959;font-size:12px}
+button{padding:6px 12px}#avatarImg{display:block;height:96px;margin-top:6px;border-radius:6px}video{width:100%;max-height:420px;background:#000;border-radius:8px;margin-top:8px}textarea{width:100%;box-sizing:border-box}#log div{margin:4px 0}.ai{color:#06c}.t{color:#595959;font-size:12px}
 </style></head><body>
 <h2>Fish Audio voice test</h2>
 <div id="status" class="t"></div>
@@ -24,8 +24,9 @@ Mode: <select id="mode">
   <option value="pass" selected>Avatar: our pipeline, Anam renders face (passthrough)</option>
   <option value="turnkey">Avatar: Anam turnkey (Fish voice imported into Anam)</option>
 </select>
-<div class="avatar">Anam avatar id: <input id="avatarId" size="38" placeholder="default stock avatar"></div>
-<div class="turnkey">Anam voice id: <input id="anamVoice" size="38"> <button id="import">Import selected Fish voice</button> <span id="importMsg" class="t"></span>
+<div class="avatar">Avatar: <select id="avatarSel"><option value="">(server default)</option></select> <input id="avatarId" size="38" placeholder="custom avatar id" hidden>
+<img id="avatarImg" alt="" hidden></div>
+<div class="turnkey">Anam voice: <select id="anamVoice"></select> <button id="import">Import selected Fish voice</button> <span id="importMsg" class="t"></span>
 <p class="t">Turnkey: Anam does speech-to-text and the LLM, then speaks in the imported Fish voice. Our ASR/LLM settings are not used.</p></div>
 <br><button id="call">Start call</button> <span id="callMsg" class="t"></span>
 </section>
@@ -41,12 +42,50 @@ const say = (cls, text) => { const d = document.createElement('div'); d.classNam
 
 fetch('/api/status').then((r) => r.json()).then((s) => {
   $('status').textContent = `FISH_API_KEY: ${s.FISH_API_KEY ? 'ok' : 'MISSING'} · LLM_API_KEY: ${s.LLM_API_KEY ? 'ok' : 'MISSING'} · ANAM_API_KEY: ${s.ANAM_API_KEY ? 'ok' : 'MISSING'} · LLM ${s.LLM_MODEL} · TTS ${s.TTS_MODEL}`;
-  $('avatarId').placeholder = s.ANAM_AVATAR_ID;
+  defaultAvatar = s.ANAM_AVATAR_ID;
   if (s.FISH_API_KEY) loadVoices();
+  if (s.ANAM_API_KEY) loadAvatars();
 });
+// remember last picks per select/input id
+const saved = (id) => { try { return localStorage.getItem('pick:' + id); } catch { return null; } };
+const remember = (id) => $(id).addEventListener('change', () => { try { localStorage.setItem('pick:' + id, $(id).value); } catch {} });
+const restore = (id, fallback) => { const v = saved(id) ?? fallback; if ([...$(id).options].some((o) => o.value === v)) $(id).value = v; };
+// fill a <select> from [[groupLabel, [[value, text]...]]...], keeping any fixed options given
+const fill = (id, groups, fixed = []) => {
+  $(id).replaceChildren(...fixed.map(([v, t]) => new Option(t, v)), ...groups.filter(([, l]) => l.length).map(([label, list]) => {
+    const g = document.createElement('optgroup'); g.label = label; g.append(...list.map(([v, t]) => new Option(t, v))); return g;
+  }));
+};
+['voice', 'mode', 'avatarSel', 'avatarId', 'anamVoice'].forEach(remember);
+$('avatarId').value = saved('avatarId') || '';
+
 async function loadVoices() {
-  try { $('voice').innerHTML = (await api('/api/voices')).map((v) => `<option value="${v.id}">${v.title} (${v.state})</option>`).join(''); }
+  try { fill('voice', [['My Fish voices', (await api('/api/voices')).map((v) => [v.id, `${v.title} (${v.state})`])]]); restore('voice'); }
   catch (e) { $('callMsg').textContent = e.message; }
+}
+let defaultAvatar = '', avatars = [];
+const showAvatar = () => {
+  const a = avatars.find((x) => x.id === $('avatarSel').value);
+  $('avatarId').hidden = $('avatarSel').value !== 'custom';
+  $('avatarImg').hidden = !a?.image; if (a?.image) $('avatarImg').src = a.image;
+};
+$('avatarSel').onchange = showAvatar;
+async function loadAvatars() {
+  try {
+    avatars = await api('/api/anam/avatars');
+    const opt = (a) => [a.id, a.name + (a.id === defaultAvatar ? ' (default)' : '')];
+    fill('avatarSel', [['My avatars', avatars.filter((a) => a.own).map(opt)], ['Stock avatars', avatars.filter((a) => !a.own).map(opt)]], [['custom', 'Custom id…']]);
+    restore('avatarSel', defaultAvatar); showAvatar();
+  } catch (e) { $('callMsg').textContent = 'avatars: ' + e.message; }
+}
+let anamVoicesLoaded = false;
+async function loadAnamVoices() {
+  anamVoicesLoaded = true;
+  try {
+    const vs = await api('/api/anam/voices'), labels = ['Imported Fish voices', 'My other voices', 'Fish Audio (stock)', 'Other stock voices'];
+    fill('anamVoice', labels.map((l, i) => [l, vs.filter((v) => v.group === i).map((v) => [v.id, `${v.name} · ${v.provider}`])]));
+    restore('anamVoice');
+  } catch (e) { anamVoicesLoaded = false; $('importMsg').textContent = 'voices: ' + e.message; }
 }
 $('refresh').onclick = loadVoices;
 
@@ -69,11 +108,14 @@ $('clone').onclick = async () => {
 };
 
 // --- mode switch + Anam avatar ---
-const showMode = () => { document.querySelector('.avatar').hidden = $('mode').value === 'audio'; document.querySelector('.turnkey').hidden = $('mode').value !== 'turnkey'; };
-$('mode').onchange = showMode; showMode();
+const showMode = () => {
+  document.querySelector('.avatar').hidden = $('mode').value === 'audio'; document.querySelector('.turnkey').hidden = $('mode').value !== 'turnkey';
+  if ($('mode').value === 'turnkey' && !anamVoicesLoaded) loadAnamVoices();
+};
+$('mode').onchange = showMode; restore('mode'); showMode();
 $('import').onclick = async () => {
   $('importMsg').textContent = 'importing (can take ~1 min)…';
-  try { const v = await api(`/api/anam/import-voice?voice=${$('voice').value}`, { method: 'POST' }); $('anamVoice').value = v.id; $('importMsg').textContent = `imported "${v.name}"`; }
+  try { const v = await api(`/api/anam/import-voice?voice=${$('voice').value}`, { method: 'POST' }); await loadAnamVoices(); $('anamVoice').value = v.id; $('importMsg').textContent = `imported "${v.name}"`; }
   catch (e) { $('importMsg').textContent = e.message; }
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -83,8 +125,9 @@ const waitFor = async (cond, ms) => { const end = Date.now() + ms; while (!cond(
 let anam = null; // { client, AnamEvent, speaking(), audioIn }
 async function startAnam(turnkey) {
   const { createClient, AnamEvent } = await import('https://esm.sh/@anam-ai/js-sdk@4.29.1');
-  const q = new URLSearchParams({ avatar: $('avatarId').value.trim() });
-  if (turnkey) { if (!$('anamVoice').value) throw new Error('import a Fish voice into Anam first'); q.set('voice', $('anamVoice').value.trim()); q.set('system', $('system').value); }
+  const avatar = $('avatarSel').value === 'custom' ? $('avatarId').value.trim() : $('avatarSel').value;
+  const q = new URLSearchParams({ avatar });
+  if (turnkey) { if (!$('anamVoice').value) throw new Error('pick or import an Anam voice first'); q.set('voice', $('anamVoice').value); q.set('system', $('system').value); }
   const { token } = await api(`/api/anam/session?${q}`, { method: 'POST' });
   const client = createClient(token, turnkey ? {} : { disableInputAudio: true });
   const a = { client, AnamEvent, speaking: () => false };
